@@ -1,0 +1,49 @@
+name: Test on Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse check (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $tokens = $null; $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\LaptopHealthCheck.ps1", [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { $errors | Format-List; exit 1 }
+          Write-Host 'No parse errors.'
+
+      - name: PSScriptAnalyzer (errors only)
+        shell: powershell
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path .\LaptopHealthCheck.ps1 -Severity Error
+          if ($issues) { $issues | Format-Table -AutoSize; exit 1 }
+          Write-Host 'No analyzer errors.'
+
+      - name: Run the health check (fast options)
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\lhc" -Force | Out-Null
+          # Defender is not active on hosted runners, so the scan is skipped here.
+          .\LaptopHealthCheck.ps1 -SkipDefenderScan -SkipSystemFileCheck -NoPause -OutputRoot "$env:RUNNER_TEMP\lhc"
+          $report = Get-ChildItem "$env:RUNNER_TEMP\lhc" -Recurse -Filter report.html | Select-Object -First 1
+          if (-not $report) { Write-Error 'report.html was not created'; exit 1 }
+          $json = Get-Content (Join-Path $report.DirectoryName 'results.json') -Raw | ConvertFrom-Json
+          $json | Group-Object Status | Format-Table Name, Count -AutoSize
+          $errs = @($json | Where-Object { $_.Status -eq 'ERROR' })
+          if ($errs.Count -gt 0) { $errs | Format-List; Write-Error 'Some checks threw script errors'; exit 1 }
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sample-report
+          path: ${{ runner.temp }}/lhc
