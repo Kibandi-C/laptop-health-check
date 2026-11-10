@@ -4,6 +4,15 @@ A one-click, unattended health and software audit for a **used Windows laptop**,
 
 It is built to catch the problems that matter most when you buy second-hand: a laptop still locked to a company, an anti-theft agent the previous owner controls, a cracked Windows licence, a worn battery or SSD, hidden crashes, and leftover remote-control or malicious software.
 
+## Two modes
+
+| Launcher | Time | Use it for |
+| --- | --- | --- |
+| `Run-QuickCheck.bat` | about 5 min | Testing a laptop **before you accept it**, e.g. at the shop. Ownership locks, licence, battery, SSD, devices, crash logs, plus a 90-second fan test that asks whether the fan spun up. Stay with the laptop. |
+| `Run-LaptopHealthCheck.bat` | about 1-3 h | The full unattended audit: everything above (except the fan test) plus Defender full scan, DISM/SFC, chkdsk, Windows Update and speed test. |
+
+Neither mode can see messages shown at power-on, before Windows loads (such as "Fan error"). Do a cold-start test by hand: shut down fully, wait 5 minutes, power on, and repeat 3 times.
+
 ## How to run it
 
 1. On the laptop, open this repository's page, click **Code > Download ZIP**, and extract the ZIP (right-click > Extract All).
@@ -21,6 +30,7 @@ Run from a PowerShell window in the extracted folder, or add the options after t
 
 | Option | Effect |
 | --- | --- |
+| `-Quick` | Quick mode (what `Run-QuickCheck.bat` uses) |
 | `-QuickScan` | Defender quick scan instead of a full scan (whole run about 30-45 min) |
 | `-SkipDefenderScan` | No malware scan |
 | `-SkipSystemFileCheck` | Skip DISM and SFC (saves 10-30 min) |

@@ -15,6 +15,13 @@
     change are Defender quarantining malware it finds and Defender downloading
     new virus definitions.
 
+.PARAMETER Quick
+    Quick check, about 5 minutes, for testing a laptop before you accept it
+    (for example at the shop). Keeps the ownership, licence, battery, SSD,
+    device and crash-log checks, adds a 90-second fan test that asks you
+    whether the fan spun up, and skips the long scans (Defender, DISM/SFC,
+    chkdsk, Windows Update search, speed test, msinfo32).
+
 .PARAMETER QuickScan
     Run a Defender quick scan (minutes) instead of a full scan (1-3 hours).
 
@@ -40,6 +47,7 @@
 #>
 [CmdletBinding()]
 param(
+    [switch]$Quick,
     [switch]$QuickScan,
     [switch]$SkipDefenderScan,
     [switch]$SkipSystemFileCheck,
@@ -48,7 +56,7 @@ param(
     [string]$OutputRoot = ''
 )
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 # ---------------------------------------------------------------------------
 # Pre-flight: Windows only, then self-elevate to Administrator
@@ -66,7 +74,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     Write-Host 'Requesting administrator rights (click Yes on the prompt)...' -ForegroundColor Yellow
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
                  '-OutputRoot', ('"{0}"' -f $OutputRoot))
-    foreach ($name in @('QuickScan', 'SkipDefenderScan', 'SkipSystemFileCheck', 'SkipNetworkTest', 'NoPause')) {
+    foreach ($name in @('Quick', 'QuickScan', 'SkipDefenderScan', 'SkipSystemFileCheck', 'SkipNetworkTest', 'NoPause')) {
         if ($PSBoundParameters.ContainsKey($name) -and $PSBoundParameters[$name]) { $argList += "-$name" }
     }
     try {
@@ -268,12 +276,12 @@ $Steps.Add(@{ Name = 'System inventory'; Body = {
     $script:Facts['OS'] = '{0} {1} (build {2}.{3})' -f $osName, $displayVersion, $cv.CurrentBuildNumber, $cv.UBR
     Add-Result 'Windows' 'INFO' ('{0}, installed {1}' -f $script:Facts['OS'], $installDate)
 
-    try {
+    if (-not $Quick) { try {
         Write-Host '  Saving the full System Information report (1-3 minutes)...' -ForegroundColor DarkGray
         $p = Start-Process -FilePath 'msinfo32.exe' -ArgumentList @('/report', ('"{0}"' -f (Join-Path $script:OutDir 'system-information.txt'))) -PassThru -WindowStyle Hidden
         if (-not $p.WaitForExit(600000)) { try { $p.Kill() } catch { } }
         Save-Artifact 'system-information.txt' 'Full System Information report (msinfo32)' $null
-    } catch { }
+    } catch { } }
 }})
 
 # 2 ------------------------------------------------------------------------
@@ -451,7 +459,9 @@ $Steps.Add(@{ Name = 'Windows licence and version'; Body = {
         }
     } catch { }
 
-    if ($script:Facts['Build'] -lt 22000) {
+    if (-not $script:Facts['Build']) {
+        Add-Result 'Windows version' 'INFO' 'Could not read the Windows build number.' 'Run "winver" to see the version.'
+    } elseif ($script:Facts['Build'] -lt 22000) {
         Add-Result 'Windows 10' 'WARN' 'This laptop runs Windows 10, which reached end of support on 14 Oct 2025.' 'Upgrade to Windows 11 if PC Health Check says it is eligible; otherwise enrol in the free consumer Extended Security Updates (currently through 12 Oct 2027).'
     } else {
         Add-Result 'Windows 11' 'PASS' $script:Facts['OS'] 'The Windows Update step below shows whether a newer version is waiting.'
@@ -617,6 +627,56 @@ $Steps.Add(@{ Name = 'Battery health'; Body = {
 }})
 
 # 6 ------------------------------------------------------------------------
+$Steps.Add(@{ Name = 'Fan and cooling test'; Body = {
+    Add-Result 'Cold-start fan check' 'INFO' 'A "Fan error" appears at power-on, before Windows loads, so this script cannot see it.' 'Shut down fully, wait 5 minutes, power on. Repeat 3 times and watch the screen each time.'
+    if (-not $Quick) { Add-Result 'Fan under load' 'SKIP' 'Runs in quick mode (Run-QuickCheck.bat), where someone is there to listen.'; return }
+    if ($NoPause)    { Add-Result 'Fan under load' 'SKIP' 'Needs a person to listen; skipped because -NoPause was used.'; return }
+
+    $seconds = 90
+    $cores = [Environment]::ProcessorCount
+    $readTemps = {
+        try {
+            @(Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop |
+              ForEach-Object { [math]::Round(($_.CurrentTemperature / 10.0) - 273.15, 0) })
+        } catch { @() }
+    }
+    $before = & $readTemps
+    $during = @()
+
+    Write-Host ''
+    Write-Host ('  FAN TEST: all {0} CPU threads will run at 100% for {1} seconds.' -f $cores, $seconds) -ForegroundColor Yellow
+    Write-Host '  Hold your hand at the air vent and listen. The fan should get clearly louder' -ForegroundColor Yellow
+    Write-Host '  and blow warm air within about a minute.' -ForegroundColor Yellow
+    $procs = @()
+    try {
+        for ($i = 0; $i -lt $cores; $i++) {
+            $procs += Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', 'while ($true) { $x = 1 }') -WindowStyle Hidden -PassThru
+        }
+        for ($t = $seconds; $t -gt 0; $t -= 5) {
+            Write-Host ('  {0,3} s left - listen for the fan...' -f $t) -ForegroundColor DarkYellow
+            Start-Sleep -Seconds 5
+        }
+        $during = & $readTemps
+    } finally {
+        foreach ($proc in $procs) { try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { } }
+    }
+
+    $answer = ''
+    while ($answer -notmatch '^[YyNnUu]$') {
+        $answer = Read-Host '  Did the fan get louder and blow warm air out of the vent? Y = yes, N = no, U = not sure'
+    }
+    $tempText = ''
+    if ($before.Count -gt 0 -and $during.Count -gt 0) {
+        $tempText = ('  |  sensor temps before: {0} C, at full load: {1} C' -f ($before -join '/'), ($during -join '/'))
+    }
+    switch -Regex ($answer) {
+        '^[Yy]$' { Add-Result 'Fan under load' 'PASS' ('Fan spun up under 90 s of full load (tester confirmed).' + $tempText) }
+        '^[Nn]$' { Add-Result 'Fan under load' 'FAIL' ('Fan did not respond to full load (tester observation).' + $tempText) 'Do not accept this laptop: the cooling fan is not working.' }
+        default  { Add-Result 'Fan under load' 'WARN' ('Tester was not sure the fan spun up.' + $tempText) 'Repeat somewhere quieter, or install HWiNFO and check the fan speed (RPM) rises under load.' }
+    }
+}})
+
+# 7 ------------------------------------------------------------------------
 $Steps.Add(@{ Name = 'Storage health and file system'; Body = {
     $disks = @()
     try { $disks = @(Get-PhysicalDisk -ErrorAction Stop) } catch { }
@@ -663,6 +723,7 @@ $Steps.Add(@{ Name = 'Storage health and file system'; Body = {
         else { Add-Result 'Free space on C:' 'PASS' $detail }
     }
 
+    if ($Quick) { Add-Result 'File system (chkdsk)' 'SKIP' 'Skipped in quick mode.' 'Covered by the full run.'; return }
     Write-Host '  Scanning the C: file system (chkdsk /scan, a few minutes)...' -ForegroundColor DarkGray
     $ck = Invoke-Native 'chkdsk.exe' @($env:SystemDrive, '/scan')
     Save-Artifact 'chkdsk.txt' 'File system scan output (chkdsk /scan)' $ck.Output
@@ -670,7 +731,7 @@ $Steps.Add(@{ Name = 'Storage health and file system'; Body = {
     else { Add-Result 'File system (chkdsk)' 'WARN' ('chkdsk exit code ' + $ck.ExitCode) 'See chkdsk.txt. Running "chkdsk C: /f" and restarting usually repairs it; repeated errors point to a failing drive.' }
 }})
 
-# 7 ------------------------------------------------------------------------
+# 8 ------------------------------------------------------------------------
 $Steps.Add(@{ Name = 'Devices and drivers'; Body = {
     $problems = @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.ConfigManagerErrorCode -ne 0 -and $_.ConfigManagerErrorCode -ne 45 })
     $disabled = @($problems | Where-Object { $_.ConfigManagerErrorCode -eq 22 })
@@ -725,7 +786,7 @@ $Steps.Add(@{ Name = 'Devices and drivers'; Body = {
     } catch { }
 }})
 
-# 8 ------------------------------------------------------------------------
+# 9 ------------------------------------------------------------------------
 $Steps.Add(@{ Name = 'Crash and hardware-error history'; Body = {
     $since = (Get-Date).AddDays(-60)
     $oldest = $null
@@ -785,9 +846,9 @@ $Steps.Add(@{ Name = 'Crash and hardware-error history'; Body = {
     } catch { }
 }})
 
-# 9 ------------------------------------------------------------------------
+# 10 -----------------------------------------------------------------------
 $Steps.Add(@{ Name = 'Windows Update and Lenovo tools'; Body = {
-    try {
+    if ($Quick) { Add-Result 'Missing updates' 'SKIP' 'Skipped in quick mode.' 'Covered by the full run.' } else { try {
         Write-Host '  Asking Windows Update for missing updates (can take several minutes)...' -ForegroundColor DarkGray
         $session  = New-Object -ComObject Microsoft.Update.Session
         $searcher = $session.CreateUpdateSearcher()
@@ -812,7 +873,7 @@ $Steps.Add(@{ Name = 'Windows Update and Lenovo tools'; Body = {
         }
     } catch {
         Add-Result 'Missing updates' 'WARN' ('Windows Update could not be queried: ' + $_.Exception.Message) 'Check the internet connection and open Settings > Windows Update by hand.'
-    }
+    } }
 
     $pending = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
                  'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') | Where-Object { Test-Path $_ }
@@ -826,7 +887,7 @@ $Steps.Add(@{ Name = 'Windows Update and Lenovo tools'; Body = {
     else { Add-Result 'Lenovo update tools' 'INFO' 'Lenovo Vantage / System Update not installed.' 'Install Lenovo Vantage from the Microsoft Store (ThinkPads: Commercial Vantage or System Update) to get BIOS and driver updates.' }
 }})
 
-# 10 -----------------------------------------------------------------------
+# 11 -----------------------------------------------------------------------
 $Steps.Add(@{ Name = 'Network'; Body = {
     $up = @()
     try { $up = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' }) } catch { }
@@ -847,9 +908,10 @@ $Steps.Add(@{ Name = 'Network'; Body = {
         if ($r.Content -match 'Microsoft Connect Test') { Add-Result 'Internet access' 'PASS' 'Connected.' }
         else { Add-Result 'Internet access' 'WARN' 'Unexpected reply - a login page or filter may be in the way.' }
     } catch {
-        Add-Result 'Internet access' 'FAIL' 'No internet connection.' 'Connect to Wi-Fi: the update and Defender steps need it.'
+        Add-Result 'Internet access' 'WARN' 'No internet connection.' 'Not a hardware fault by itself. Connect to Wi-Fi and confirm it works; the full run needs internet for updates and Defender.'
         return
     }
+    if ($Quick) { return }
     try {
         $tmp = Join-Path $env:TEMP 'lhc-speedtest.bin'
         $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -864,9 +926,9 @@ $Steps.Add(@{ Name = 'Network'; Body = {
     }
 }})
 
-# 11 -----------------------------------------------------------------------
+# 12 -----------------------------------------------------------------------
 $Steps.Add(@{ Name = 'System file integrity (DISM and SFC)'; Body = {
-    if ($SkipSystemFileCheck) { Add-Result 'System files' 'SKIP' 'Skipped by option.'; return }
+    if ($SkipSystemFileCheck -or $Quick) { Add-Result 'System files' 'SKIP' 'Skipped (quick mode or option).' 'Covered by the full run.'; return }
 
     Write-Host '  DISM component store scan (5-20 minutes)...' -ForegroundColor DarkGray
     $dism = Invoke-Native 'dism.exe' @('/Online', '/Cleanup-Image', '/ScanHealth')
@@ -900,9 +962,9 @@ $Steps.Add(@{ Name = 'System file integrity (DISM and SFC)'; Body = {
     }
 }})
 
-# 12 -----------------------------------------------------------------------
+# 13 -----------------------------------------------------------------------
 $Steps.Add(@{ Name = 'Malware scan (Microsoft Defender)'; Body = {
-    if ($SkipDefenderScan) { Add-Result 'Defender scan' 'SKIP' 'Skipped by option.'; return }
+    if ($SkipDefenderScan -or $Quick) { Add-Result 'Defender scan' 'SKIP' 'Skipped (quick mode or option).' 'Covered by the full run.'; return }
     $mode = $script:Facts['DefenderMode']
     if ($mode -and $mode -ne 'Normal') {
         Add-Result 'Defender scan' 'SKIP' ('Defender is in "{0}" mode, usually because another antivirus is installed.' -f $mode) 'Run a full scan with the installed antivirus instead.'
@@ -945,7 +1007,11 @@ $Steps.Add(@{ Name = 'Malware scan (Microsoft Defender)'; Body = {
 Write-Host ''
 Write-Host ('Laptop Health Check v{0}' -f $ScriptVersion) -ForegroundColor Cyan
 Write-Host ('Report folder: {0}' -f $script:OutDir) -ForegroundColor Cyan
-Write-Host 'Keep the charger plugged in and the lid open. Total time: about 1-3 hours with the full Defender scan.' -ForegroundColor Cyan
+if ($Quick) {
+    Write-Host 'QUICK MODE: about 5 minutes. Stay with the laptop - the fan test will ask you a question.' -ForegroundColor Cyan
+} else {
+    Write-Host 'Keep the charger plugged in and the lid open. Total time: about 1-3 hours with the full Defender scan.' -ForegroundColor Cyan
+}
 
 $bat = @(Get-CimInstance Win32_Battery)
 if ($bat.Count -gt 0 -and [int]$bat[0].BatteryStatus -eq 1) {
@@ -1023,7 +1089,9 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.AppendLine('<h1>Laptop Health Check report</h1>')
 [void]$sb.AppendLine(('<p class="meta"><b>{0}</b> &middot; serial {1}</p>' -f (ConvertTo-HtmlText $script:Facts['Model']), (ConvertTo-HtmlText $script:Facts['Serial'])))
 [void]$sb.AppendLine(('<p class="meta">{0}</p>' -f (ConvertTo-HtmlText $script:Facts['OS'])))
-[void]$sb.AppendLine(('<p class="meta">Run {0} to {1} ({2:N0} min) &middot; script v{3}</p>' -f $script:StartTime.ToString('yyyy-MM-dd HH:mm'), $endTime.ToString('HH:mm'), $duration.TotalMinutes, $ScriptVersion))
+$modeText = 'Full check'
+if ($Quick) { $modeText = 'Quick check (long scans skipped)' }
+[void]$sb.AppendLine(('<p class="meta">{4} &middot; run {0} to {1} ({2:N0} min) &middot; script v{3}</p>' -f $script:StartTime.ToString('yyyy-MM-dd HH:mm'), $endTime.ToString('HH:mm'), $duration.TotalMinutes, $ScriptVersion, $modeText))
 [void]$sb.AppendLine(('<div class="verdict {0}">{1}</div>' -f $verdictClass, (ConvertTo-HtmlText $verdict)))
 [void]$sb.Append('<p class="counts">')
 foreach ($s in @('FAIL', 'WARN', 'PASS', 'INFO', 'SKIP', 'ERROR')) {
@@ -1061,7 +1129,7 @@ if ($script:Artifacts.Count -gt 0) {
     [void]$sb.AppendLine('</table>')
 }
 
-[void]$sb.AppendLine('<h2>Not covered by this script</h2><p class="note">These need a person or a reboot: screen (dead pixels, hinge flicker), keyboard and touchpad, speakers, microphone and webcam image, every port, Bluetooth pairing, the CPU/GPU stress test with temperatures, MemTest86, the battery rundown, and checking the BIOS screens by eye. Follow Phases 0-3 of the testing plan for those.</p>')
+[void]$sb.AppendLine('<h2>Not covered by this script</h2><p class="note"><b>Cold-start test:</b> shut down fully, wait 5 minutes, power on, and watch for "Fan error" or any other message before Windows loads. Repeat 3 times. This script cannot see that screen.<br><br>These also need a person or a reboot: screen (dead pixels, hinge flicker), keyboard and touchpad, speakers, microphone and webcam image, every port, Bluetooth pairing, the CPU/GPU stress test with temperatures, MemTest86, the battery rundown, and checking the BIOS screens by eye. Follow Phases 0-3 of the testing plan for those.</p>')
 [void]$sb.AppendLine('</body></html>')
 
 $reportFile = Join-Path $script:OutDir 'report.html'
