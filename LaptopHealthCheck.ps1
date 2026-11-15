@@ -1,11 +1,13 @@
 <#
 .SYNOPSIS
     Laptop Health Check - an unattended software and health audit for a used
-    Windows laptop (Lenovo-aware). Run it once, leave it, read the report.
+    Windows laptop of any brand, with extra firmware checks for Lenovo, Dell
+    and HP. Run it once, leave it, read the report.
 
 .DESCRIPTION
     Checks ownership locks (company enrolment, Autopilot, Absolute/Computrace,
-    BIOS passwords on ThinkPads), Windows licence and version, security
+    BIOS passwords on Lenovo, Dell and HP business models), Windows licence
+    and version, security
     settings, remote-access software, battery and SSD health, device and
     driver problems, crash and hardware-error logs, pending Windows updates,
     network, system file integrity (DISM + SFC) and runs a Microsoft Defender
@@ -56,7 +58,7 @@ param(
     [string]$OutputRoot = ''
 )
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 
 # ---------------------------------------------------------------------------
 # Pre-flight: Windows only, then self-elevate to Administrator
@@ -67,18 +69,34 @@ if ($env:OS -ne 'Windows_NT') {
 }
 
 if (-not $OutputRoot) { $OutputRoot = [Environment]::GetFolderPath('Desktop') }
+if (-not $OutputRoot) { $OutputRoot = $env:USERPROFILE }
+$OutputRoot = $OutputRoot.TrimEnd('\')   # a trailing \ would break the quoting below
+
+# Arguments to start this script again with the same options
+$argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
+             '-OutputRoot', ('"{0}"' -f $OutputRoot))
+foreach ($name in @('Quick', 'QuickScan', 'SkipDefenderScan', 'SkipSystemFileCheck', 'SkipNetworkTest', 'NoPause')) {
+    if ($PSBoundParameters.ContainsKey($name) -and $PSBoundParameters[$name]) { $argList += "-$name" }
+}
+
+# 32-bit PowerShell on 64-bit Windows cannot run DISM and sees redirected
+# registry keys, so restart in the native 64-bit PowerShell.
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    $nativePs = Join-Path $env:windir 'sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path $nativePs) {
+        $p = Start-Process -FilePath $nativePs -ArgumentList $argList -Wait -PassThru -NoNewWindow
+        exit $p.ExitCode
+    }
+}
 
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host 'Requesting administrator rights (click Yes on the prompt)...' -ForegroundColor Yellow
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
-                 '-OutputRoot', ('"{0}"' -f $OutputRoot))
-    foreach ($name in @('Quick', 'QuickScan', 'SkipDefenderScan', 'SkipSystemFileCheck', 'SkipNetworkTest', 'NoPause')) {
-        if ($PSBoundParameters.ContainsKey($name) -and $PSBoundParameters[$name]) { $argList += "-$name" }
-    }
     try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -ErrorAction Stop
+        $selfPs = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        if (-not (Test-Path $selfPs)) { $selfPs = 'powershell.exe' }
+        Start-Process -FilePath $selfPs -ArgumentList $argList -Verb RunAs -ErrorAction Stop
     } catch {
         Write-Host 'Administrator rights were refused. The checks need them, so the script will stop.' -ForegroundColor Red
         Start-Sleep -Seconds 8
@@ -103,8 +121,21 @@ $script:Timings        = [ordered]@{}
 $script:Facts          = @{}
 $script:CurrentSection = 'General'
 $script:StartTime      = Get-Date
-$script:OutDir         = Join-Path $OutputRoot ('LaptopHealthCheck_' + (Get-Date -Format 'yyyy-MM-dd_HHmm'))
-New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null
+$reportFolderName      = 'LaptopHealthCheck_' + (Get-Date -Format 'yyyy-MM-dd_HHmm')
+$script:OutDir         = Join-Path $OutputRoot $reportFolderName
+try {
+    # Test that we can really write here: Controlled folder access (ransomware
+    # protection) or folder permissions can block writes to the Desktop.
+    New-Item -ItemType Directory -Path $script:OutDir -Force -ErrorAction Stop | Out-Null
+    $probe = Join-Path $script:OutDir 'write-test.tmp'
+    Set-Content -Path $probe -Value 'ok' -ErrorAction Stop
+    Remove-Item -Path $probe -Force -ErrorAction SilentlyContinue
+} catch {
+    $fallbackRoot = Join-Path $env:SystemDrive 'LaptopHealthCheck-Reports'
+    Write-Host ('Cannot write to {0} (Controlled folder access or permissions). Saving the report to {1} instead.' -f $OutputRoot, $fallbackRoot) -ForegroundColor Yellow
+    $script:OutDir = Join-Path $fallbackRoot $reportFolderName
+    New-Item -ItemType Directory -Path $script:OutDir -Force | Out-Null
+}
 
 try { Start-Transcript -Path (Join-Path $script:OutDir 'console-log.txt') -Force | Out-Null } catch { }
 
@@ -188,6 +219,30 @@ function Format-Bytes {
     return ('{0:N0} MB' -f ($Bytes / $mb))
 }
 
+# Which brand is this? Used for brand-specific firmware checks and advice.
+$script:VendorInfo = @{
+    Lenovo    = @{ Support = 'https://pcsupport.lenovo.com';          BiosKey = 'F1 (ThinkPad) or F2 / Fn+F2 / the Novo button (IdeaPad, Yoga, Legion)'; Tools = 'Lenovo Vantage (Microsoft Store), or Lenovo System Update / Commercial Vantage on ThinkPads'; ToolPattern = 'Lenovo ?(System Update|Vantage|Commercial Vantage|Companion|SettingsforEnterprise)' }
+    Dell      = @{ Support = 'https://www.dell.com/support';          BiosKey = 'F2';                                       Tools = 'Dell Command | Update or Dell SupportAssist';          ToolPattern = 'Dell ?(Command|SupportAssist|Update)' }
+    HP        = @{ Support = 'https://support.hp.com';                BiosKey = 'Esc, then F10';                            Tools = 'HP Support Assistant or HP Image Assistant';           ToolPattern = 'HP ?(Support ?Assistant|Image Assistant)|myHP' }
+    ASUS      = @{ Support = 'https://www.asus.com/support';          BiosKey = 'F2 or Del';                                Tools = 'MyASUS (Microsoft Store)';                             ToolPattern = 'MyASUS|ASUSPCAssistant' }
+    Acer      = @{ Support = 'https://www.acer.com/support';          BiosKey = 'F2';                                       Tools = 'Acer Care Center';                                     ToolPattern = 'Acer ?Care ?Center|AcerCareCenter' }
+    MSI       = @{ Support = 'https://www.msi.com/support';           BiosKey = 'Del';                                      Tools = 'MSI Center';                                           ToolPattern = 'MSI ?Center|Dragon ?Center' }
+    Microsoft = @{ Support = 'https://support.microsoft.com/surface'; BiosKey = 'hold Volume Up while pressing Power';       Tools = 'Windows Update (Surface drivers and firmware come through it)'; ToolPattern = '' }
+    Other     = @{ Support = "the manufacturer's support website";    BiosKey = 'usually F2, Del, F10 or Esc right after power-on'; Tools = "the manufacturer's driver/update app, or Windows Update"; ToolPattern = '' }
+}
+$script:Vendor = 'Other'
+try {
+    $mfr = '' + (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer
+    if     ($mfr -match 'LENOVO')               { $script:Vendor = 'Lenovo' }
+    elseif ($mfr -match 'Dell')                 { $script:Vendor = 'Dell' }
+    elseif ($mfr -match '^HP|Hewlett')          { $script:Vendor = 'HP' }
+    elseif ($mfr -match 'ASUS')                 { $script:Vendor = 'ASUS' }
+    elseif ($mfr -match '^Acer')                { $script:Vendor = 'Acer' }
+    elseif ($mfr -match '^Micro-Star|^MSI')     { $script:Vendor = 'MSI' }
+    elseif ($mfr -match '^Microsoft')           { $script:Vendor = 'Microsoft' }
+} catch { }
+$script:VI = $script:VendorInfo[$script:Vendor]
+
 # Keep the PC awake while the script runs (does not change power settings).
 $keepAwake = $false
 try {
@@ -216,13 +271,25 @@ $Steps.Add(@{ Name = 'System inventory'; Body = {
     $ram  = @(Get-CimInstance Win32_PhysicalMemory)
     $gpus = @(Get-CimInstance Win32_VideoController)
 
-    $script:Facts['Model']  = ('{0} {1}' -f $csp.Version, $csp.Name).Trim()
     $script:Facts['Serial'] = ('' + $csp.IdentifyingNumber).Trim()
-
-    Add-Result 'Manufacturer and model' 'INFO' ('{0} {1}  |  Machine type (MTM): {2}' -f $cs.Manufacturer, $csp.Version, $csp.Name)
-    if (('' + $cs.Manufacturer) -notmatch 'LENOVO') {
-        Add-Result 'Lenovo identity' 'WARN' ("Firmware reports the maker as '{0}', not Lenovo." -f $cs.Manufacturer) 'Unexpected on a Lenovo laptop: the motherboard may have been replaced. Ask the seller.'
+    if ($script:Vendor -eq 'Lenovo') {
+        # Lenovo keeps the friendly name (e.g. ThinkPad T495s) in Version and the machine type in Name
+        $script:Facts['Model'] = ('{0} {1} ({2})' -f $cs.Manufacturer, $csp.Version, $csp.Name).Trim()
+    } else {
+        $script:Facts['Model'] = ('{0} {1}' -f $cs.Manufacturer, $cs.Model).Trim()
     }
+    Add-Result 'Manufacturer and model' 'INFO' $script:Facts['Model']
+
+    $mfrPlaceholder = '^(|System manufacturer|To be filled by O\.E\.M\.|Default string|OEM|Not Applicable)$'
+    if (('' + $cs.Manufacturer).Trim() -match $mfrPlaceholder -or ('' + $cs.Model).Trim() -match '^(|System Product Name|To be filled by O\.E\.M\.|Default string)$') {
+        Add-Result 'Firmware identity' 'WARN' ("Maker/model not programmed in the firmware ('{0}' / '{1}')." -f $cs.Manufacturer, $cs.Model) 'On a branded laptop this usually means the motherboard was replaced and never programmed. Ask the seller.'
+    }
+
+    $pcType = [int]$cs.PCSystemType
+    $chassis = @()
+    try { $chassis = @((Get-CimInstance Win32_SystemEnclosure -ErrorAction Stop).ChassisTypes) } catch { }
+    $portableChassis = @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32)
+    $script:Facts['IsPortable'] = ($pcType -eq 2) -or (@($chassis | Where-Object { $portableChassis -contains [int]$_ }).Count -gt 0)
 
     $placeholder = '^(|0+|Default string|To be filled by O\.E\.M\.|System Serial Number|None|Not Applicable)$'
     $serialA = ('' + $csp.IdentifyingNumber).Trim()
@@ -232,7 +299,7 @@ $Steps.Add(@{ Name = 'System inventory'; Body = {
     } elseif ($serialA -ne $serialB) {
         Add-Result 'Serial number' 'WARN' ("Two different serials reported: {0} and {1}" -f $serialA, $serialB) 'Compare both with the sticker under the laptop.'
     } else {
-        Add-Result 'Serial number' 'INFO' $serialA 'Must match the sticker under the laptop. Enter it at https://pcsupport.lenovo.com to see warranty and the original factory specs.'
+        Add-Result 'Serial number' 'INFO' $serialA ('Must match the sticker under the laptop. Enter it at {0} to see the warranty status and original factory specs.' -f $script:VI.Support)
     }
 
     $biosDate = ''
@@ -325,7 +392,7 @@ $Steps.Add(@{ Name = 'Ownership and lock checks'; Body = {
         }
     }
     if ($enrolments.Count -gt 0) {
-        Add-Result 'Device-management enrolment' 'WARN' ('Enrolment records found: ' + (($enrolments | Select-Object -Unique) -join '; ')) 'Leftover or active management. Confirm with the clean reinstall (Phase 4 of the plan) that no company login appears.'
+        Add-Result 'Device-management enrolment' 'WARN' ('Enrolment records found: ' + (($enrolments | Select-Object -Unique) -join '; ')) 'Leftover or active management. Confirm with a clean reinstall of Windows that setup shows no company login.'
     } else {
         Add-Result 'Device-management enrolment' 'PASS' 'No MDM enrolment records.'
     }
@@ -361,65 +428,96 @@ $Steps.Add(@{ Name = 'Ownership and lock checks'; Body = {
         Add-Result 'Absolute / Computrace agent' 'PASS' 'No Absolute (Computrace) agent found in Windows.'
     }
 
-    # Lenovo BIOS WMI (ThinkPad / ThinkBook / commercial models only)
-    $lenovoWmi = $true
+    # BIOS passwords and the Absolute BIOS setting, read from the maker's firmware
+    # WMI where it exists (Lenovo ThinkPad/ThinkBook, Dell and HP business models).
+    # Every other model gets a SKIP with instructions for a manual check.
+    $manualBios = ('Check by hand: restart, open the BIOS ({0}) and confirm it opens without asking for a password.' -f $script:VI.BiosKey)
+    $pwChecked = $false; $pwSet = @(); $pwSupervisor = $false
     try {
-        $pw = @(Get-CimInstance -Namespace root\wmi -ClassName Lenovo_BiosPasswordSettings -ErrorAction Stop)
-        if ($pw.Count -gt 0) {
-            $state = [int]$pw[0].PasswordState
-            $set = @()
-            if ($state -band 1)  { $set += 'power-on' }
-            if ($state -band 2)  { $set += 'supervisor' }
-            if ($state -band 4)  { $set += 'hard-disk' }
-            if ($state -band 64) { $set += 'system-management' }
-            if ($state -band 2) {
-                Add-Result 'BIOS passwords' 'FAIL' ('Passwords set: ' + ($set -join ', ')) 'A supervisor password locks the BIOS and cannot be removed without the previous owner. Get it from the seller or return the laptop.'
-            } elseif ($state -ne 0) {
-                if ($set.Count -eq 0) { $set += ('state code ' + $state) }
-                Add-Result 'BIOS passwords' 'WARN' ('Passwords set: ' + ($set -join ', ')) 'Get the password from the seller and remove it in the BIOS.'
-            } else {
-                Add-Result 'BIOS passwords' 'PASS' 'No BIOS passwords set.'
+        if ($script:Vendor -eq 'Lenovo') {
+            $pw = @(Get-CimInstance -Namespace root\wmi -ClassName Lenovo_BiosPasswordSettings -ErrorAction Stop)
+            if ($pw.Count -gt 0) {
+                $pwChecked = $true
+                $state = [int]$pw[0].PasswordState
+                if ($state -band 1)  { $pwSet += 'power-on' }
+                if ($state -band 2)  { $pwSet += 'supervisor'; $pwSupervisor = $true }
+                if ($state -band 4)  { $pwSet += 'hard-disk' }
+                if ($state -band 64) { $pwSet += 'system-management' }
+                if ($state -ne 0 -and $pwSet.Count -eq 0) { $pwSet += ('state code ' + $state) }
             }
-        }
-    } catch {
-        $lenovoWmi = $false
-        Add-Result 'BIOS passwords' 'SKIP' 'This model does not report BIOS passwords to Windows (normal on IdeaPad, Yoga and Legion).' 'Check by hand: restart, press F2 (or Fn+F2 / the Novo button) and confirm the BIOS opens without a password.'
-    }
-    if ($lenovoWmi) {
-        try {
-            $settings = @(Get-CimInstance -Namespace root\wmi -ClassName Lenovo_BiosSetting -ErrorAction Stop |
-                          Where-Object { $_.CurrentSetting -match '^(\w*(Computrace|Absolute)\w*|SecureBoot|SecurityChip)\s*,' })
-            foreach ($s in $settings) {
-                $pair  = ($s.CurrentSetting -split ';')[0]
-                $name  = ($pair -split ',')[0]
-                $value = ($pair -split ',', 2)[1]
-                if ($name -match 'Computrace|Absolute') {
-                    if ($value -match '^Enable') {
-                        Add-Result ('BIOS: ' + $name) 'WARN' $value 'The Absolute module can be activated by the previous owner. Ask the seller; ideally it shows Disable or Permanently Disable.'
-                    } else {
-                        Add-Result ('BIOS: ' + $name) 'PASS' $value
-                    }
-                } else {
-                    Add-Result ('BIOS: ' + $name) 'INFO' $value
+        } elseif ($script:Vendor -eq 'HP') {
+            $pw = @(Get-CimInstance -Namespace root\HP\InstrumentedBIOS -ClassName HP_BIOSPassword -ErrorAction Stop)
+            if ($pw.Count -gt 0) {
+                $pwChecked = $true
+                foreach ($p in @($pw | Where-Object { [int]$_.IsSet -eq 1 })) {
+                    $pwSet += $p.Name
+                    if ($p.Name -match 'Setup|Admin') { $pwSupervisor = $true }
                 }
             }
-        } catch { }
+        } elseif ($script:Vendor -eq 'Dell') {
+            $pw = @(Get-CimInstance -Namespace root\dcim\sysman\wmisecurity -ClassName PasswordObject -ErrorAction Stop)
+            if ($pw.Count -gt 0) {
+                $pwChecked = $true
+                foreach ($p in @($pw | Where-Object { [int]$_.IsPasswordSet -eq 1 })) {
+                    $pwSet += $p.NameId
+                    if ($p.NameId -match 'Admin') { $pwSupervisor = $true }
+                }
+            }
+        }
+    } catch { $pwChecked = $false }
+
+    if (-not $pwChecked) {
+        Add-Result 'BIOS passwords' 'SKIP' 'This model does not report BIOS passwords to Windows.' $manualBios
+    } elseif ($pwSupervisor) {
+        Add-Result 'BIOS passwords' 'FAIL' ('Passwords set: ' + ($pwSet -join ', ')) 'A supervisor/admin BIOS password locks the firmware and usually cannot be removed without the previous owner. Get it from the seller or return the laptop.'
+    } elseif ($pwSet.Count -gt 0) {
+        Add-Result 'BIOS passwords' 'WARN' ('Passwords set: ' + ($pwSet -join ', ')) 'Get the password from the seller and remove it in the BIOS.'
+    } else {
+        Add-Result 'BIOS passwords' 'PASS' 'No BIOS passwords set.'
+    }
+
+    $absSettings = @()
+    try {
+        if ($script:Vendor -eq 'Lenovo') {
+            foreach ($s in @(Get-CimInstance -Namespace root\wmi -ClassName Lenovo_BiosSetting -ErrorAction Stop | Where-Object { $_.CurrentSetting -match '^\w*(Computrace|Absolute)\w*\s*,' })) {
+                $pair = ($s.CurrentSetting -split ';')[0]
+                $absSettings += @{ Name = ($pair -split ',')[0]; Value = ('' + ($pair -split ',', 2)[1]) }
+            }
+        } elseif ($script:Vendor -eq 'HP') {
+            foreach ($s in @(Get-CimInstance -Namespace root\HP\InstrumentedBIOS -ClassName HP_BIOSSetting -ErrorAction Stop | Where-Object { $_.Name -match 'Absolute|Computrace' })) {
+                $v = ''
+                if ($s.PSObject.Properties['CurrentValue'] -and $s.CurrentValue) { $v = $s.CurrentValue }
+                elseif ($s.PSObject.Properties['Value']) { $v = $s.Value }
+                $absSettings += @{ Name = $s.Name; Value = ('' + $v) }
+            }
+        } elseif ($script:Vendor -eq 'Dell') {
+            foreach ($s in @(Get-CimInstance -Namespace root\dcim\sysman\biosattributes -ClassName EnumerationAttribute -ErrorAction Stop | Where-Object { $_.AttributeName -match 'Absolute|Computrace' })) {
+                $absSettings += @{ Name = $s.AttributeName; Value = (@($s.CurrentValue) -join ', ') }
+            }
+        }
+    } catch { }
+    foreach ($a in $absSettings) {
+        if ($a.Value -match '^\s*(Enable|Activ)') {
+            Add-Result ('BIOS: ' + $a.Name) 'WARN' $a.Value 'The Absolute anti-theft module can be activated by the previous owner. Ask the seller; ideally it shows Disabled, Inactive or Permanently Disabled.'
+        } elseif ($a.Value -match 'Disable|Inactive|Deactivat') {
+            Add-Result ('BIOS: ' + $a.Name) 'PASS' $a.Value
+        } else {
+            Add-Result ('BIOS: ' + $a.Name) 'INFO' $a.Value
+        }
     }
 
     # Local accounts and leftover profiles
     $users = @()
     try { $users = @(Get-LocalUser -ErrorAction Stop | Where-Object { $_.Enabled }) } catch { }
     if ($users.Count -gt 0) {
-        Add-Result 'Enabled local accounts' 'INFO' (($users | ForEach-Object { $_.Name }) -join ', ') 'Any account she does not recognise belongs to a previous owner. The clean reinstall removes them.'
+        Add-Result 'Enabled local accounts' 'INFO' (($users | ForEach-Object { $_.Name }) -join ', ') 'Any account the new owner does not recognise belongs to a previous owner. A clean reinstall removes them.'
     }
     try {
+        # Read the Administrators group by its SID through ADSI: works in every
+        # Windows language (the group name and "net localgroup" text are localised).
         $adminName = (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
-        $lines = (Invoke-Native 'net.exe' @('localgroup', $adminName)).Output -split "`r?`n"
-        $members = @(); $inList = $false
-        foreach ($l in $lines) {
-            if ($l -match '^-{5,}') { $inList = $true; continue }
-            if ($inList -and $l.Trim() -and $l -notmatch '^The command') { $members += $l.Trim() }
-        }
+        $group = [ADSI]('WinNT://{0}/{1},group' -f $env:COMPUTERNAME, $adminName)
+        $members = @($group.psbase.Invoke('Members') | ForEach-Object { $_.GetType().InvokeMember('Name', 'GetProperty', $null, $_, $null) })
         Add-Result 'Administrator accounts' 'INFO' ($members -join ', ')
     } catch { }
     $profiles = @(Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special } | ForEach-Object { $_.LocalPath })
@@ -436,15 +534,22 @@ $Steps.Add(@{ Name = 'Windows licence and version'; Body = {
         $l = $lic[0]
         $statusNames = @{ 0 = 'Unlicensed'; 1 = 'Licensed'; 2 = 'Initial grace period'; 3 = 'Additional grace period'; 4 = 'Non-genuine grace period'; 5 = 'Notification mode'; 6 = 'Extended grace period' }
         $statusText = $statusNames[[int]$l.LicenseStatus]
+        # ProductKeyChannel (e.g. OEM:DM, Retail, Volume:GVLK, Volume:MAK) is not
+        # localised; the Description text is the fallback for older builds.
         $channel = 'unknown'
-        if ($l.Description -match ',\s*(\S+)\s+channel') { $channel = $Matches[1] }
+        if ($l.PSObject.Properties['ProductKeyChannel'] -and $l.ProductKeyChannel) { $channel = '' + $l.ProductKeyChannel }
+        elseif ($l.Description -match ',\s*(\S+)\s+channel') { $channel = $Matches[1] }
+        $kmsHost = ''
+        if ($l.PSObject.Properties['KeyManagementServiceMachine'] -and $l.KeyManagementServiceMachine) { $kmsHost = '' + $l.KeyManagementServiceMachine }
         $detail = '{0} | status: {1} | channel: {2} | key ends {3}' -f $l.Name, $statusText, $channel, $l.PartialProductKey
         if ([int]$l.LicenseStatus -ne 1) {
             Add-Result 'Activation' 'FAIL' $detail 'Windows is not genuinely activated.'
-        } elseif ($channel -match 'KMS') {
+        } elseif ($channel -match 'KMS|GVLK' -or $kmsHost) {
             $kms = ''
-            if ($l.PSObject.Properties['KeyManagementServiceMachine'] -and $l.KeyManagementServiceMachine) { $kms = ' | KMS host: ' + $l.KeyManagementServiceMachine }
+            if ($kmsHost) { $kms = ' | KMS host: ' + $kmsHost }
             Add-Result 'Activation' 'WARN' ($detail + $kms) 'Volume (KMS) activation on a personal laptop usually means a crack tool or a company licence that will lapse. Plan a genuine licence; the clean reinstall may reactivate with the factory key.'
+        } elseif ($channel -match 'MAK') {
+            Add-Result 'Activation' 'WARN' $detail 'A volume (MAK) key belongs to a company or school licence, not to this laptop. It can be blocked at any time; plan a genuine licence.'
         } else {
             Add-Result 'Activation' 'PASS' $detail
         }
@@ -480,7 +585,8 @@ $Steps.Add(@{ Name = 'Security settings and unwanted software'; Body = {
             Add-Result 'Microsoft Defender' 'WARN' ('Antivirus enabled: {0} | real-time: {1} | mode: {2}' -f $mp.AntivirusEnabled, $mp.RealTimeProtectionEnabled, $mp.AMRunningMode) 'Turn real-time protection on in Windows Security, unless another antivirus is installed.'
         }
     } catch {
-        Add-Result 'Microsoft Defender' 'WARN' 'Could not read Defender status.' $_.Exception.Message
+        $script:Facts['DefenderMode'] = 'Unavailable'
+        Add-Result 'Microsoft Defender' 'WARN' 'Could not read Defender status (it may be removed or replaced by another antivirus).' $_.Exception.Message
     }
     try {
         $av = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object { $_.displayName })
@@ -517,9 +623,9 @@ $Steps.Add(@{ Name = 'Security settings and unwanted software'; Body = {
         $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
         $bitlockerDone = $true
         if ([string]$bl.ProtectionStatus -eq 'On') {
-            Add-Result 'Drive encryption' 'PASS' ('BitLocker on (' + $bl.VolumeStatus + ')') 'Make sure the recovery key is saved in HER Microsoft account (account.microsoft.com/devices/recoverykey), not a previous owner''s.'
+            Add-Result 'Drive encryption' 'PASS' ('BitLocker on (' + $bl.VolumeStatus + ')') 'Make sure the recovery key is saved in YOUR Microsoft account (account.microsoft.com/devices/recoverykey), not a previous owner''s.'
         } else {
-            Add-Result 'Drive encryption' 'INFO' ('Off (' + $bl.VolumeStatus + ')') 'Turn on device encryption after the clean reinstall, signed in with her Microsoft account.'
+            Add-Result 'Drive encryption' 'INFO' ('Off (' + $bl.VolumeStatus + ')') 'Turn on device encryption after the clean reinstall, signed in with your own Microsoft account.'
         }
     } catch { }
     if (-not $bitlockerDone) {
@@ -532,7 +638,7 @@ $Steps.Add(@{ Name = 'Security settings and unwanted software'; Body = {
     if ($sys -and $sys.EnableLUA -eq 0) { Add-Result 'User Account Control' 'FAIL' 'UAC is turned off.' 'Turn UAC back on; it blocks silent admin changes.' }
     else { Add-Result 'User Account Control' 'PASS' 'On.' }
     $ts = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue
-    if ($ts -and $ts.fDenyTSConnections -eq 0) { Add-Result 'Remote Desktop' 'WARN' 'Incoming Remote Desktop connections are allowed.' 'Turn off in Settings > System > Remote Desktop unless she needs it.' }
+    if ($ts -and $ts.fDenyTSConnections -eq 0) { Add-Result 'Remote Desktop' 'WARN' 'Incoming Remote Desktop connections are allowed.' 'Turn off in Settings > System > Remote Desktop unless you need it.' }
     else { Add-Result 'Remote Desktop' 'PASS' 'Incoming connections are off.' }
 
     # Remote-access and remote-management software
@@ -546,7 +652,7 @@ $Steps.Add(@{ Name = 'Security settings and unwanted software'; Body = {
     $found += @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $raPattern } | ForEach-Object { 'running: ' + $_.ProcessName })
     $found = @($found | Select-Object -Unique)
     if ($found.Count -gt 0) {
-        Add-Result 'Remote-access software' 'WARN' ($found -join "`n") 'Remote-control tools let someone else see and control the laptop. Remove any she did not install herself (the clean reinstall removes them all).'
+        Add-Result 'Remote-access software' 'WARN' ($found -join "`n") 'Remote-control tools let someone else see and control the laptop. Remove any you did not install yourself (the clean reinstall removes them all).'
     } else {
         Add-Result 'Remote-access software' 'PASS' 'None of the common remote-control or remote-management tools found.'
     }
@@ -556,7 +662,7 @@ $Steps.Add(@{ Name = 'Security settings and unwanted software'; Body = {
     $proxyBits = @()
     if ($inet -and $inet.ProxyEnable -eq 1) { $proxyBits += ('proxy server ' + $inet.ProxyServer) }
     if ($inet -and $inet.PSObject.Properties['AutoConfigURL'] -and $inet.AutoConfigURL) { $proxyBits += ('auto-config script ' + $inet.AutoConfigURL) }
-    if ($proxyBits.Count -gt 0) { Add-Result 'Web proxy' 'WARN' ($proxyBits -join ' | ') 'A proxy can route her browsing through someone else''s server. Turn it off in Settings > Network & internet > Proxy unless she set it.' }
+    if ($proxyBits.Count -gt 0) { Add-Result 'Web proxy' 'WARN' ($proxyBits -join ' | ') 'A proxy can route your browsing through someone else''s server. Turn it off in Settings > Network & internet > Proxy unless you set it.' }
     else { Add-Result 'Web proxy' 'PASS' 'No proxy configured.' }
 
     $hostsPath = Join-Path $env:windir 'System32\drivers\etc\hosts'
@@ -584,7 +690,11 @@ $Steps.Add(@{ Name = 'Security settings and unwanted software'; Body = {
 $Steps.Add(@{ Name = 'Battery health'; Body = {
     $batteries = @(Get-CimInstance Win32_Battery)
     if ($batteries.Count -eq 0) {
-        Add-Result 'Battery' 'FAIL' 'No battery detected.' 'The battery is dead, disconnected or missing.'
+        if ($script:Facts['IsPortable']) {
+            Add-Result 'Battery' 'FAIL' 'No battery detected on this laptop.' 'The battery is dead, disconnected or missing.'
+        } else {
+            Add-Result 'Battery' 'INFO' 'No battery (this PC reports itself as a desktop).'
+        }
         return
     }
     $reportPath = Join-Path $script:OutDir 'battery-report.html'
@@ -647,10 +757,15 @@ $Steps.Add(@{ Name = 'Fan and cooling test'; Body = {
     Write-Host ('  FAN TEST: all {0} CPU threads will run at 100% for {1} seconds.' -f $cores, $seconds) -ForegroundColor Yellow
     Write-Host '  Hold your hand at the air vent and listen. The fan should get clearly louder' -ForegroundColor Yellow
     Write-Host '  and blow warm air within about a minute.' -ForegroundColor Yellow
+    Write-Host '  (If this laptop has no fan at all, answer S at the end.)' -ForegroundColor Yellow
+    # Each load process stops by itself after the test time, even if this window
+    # is closed mid-test, so no stray 100% CPU processes are left behind.
+    $loadScript  = '$e = [DateTime]::Now.AddSeconds({0}); while ([DateTime]::Now -lt $e) {{ }}' -f ($seconds + 10)
+    $loadEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loadScript))
     $procs = @()
     try {
         for ($i = 0; $i -lt $cores; $i++) {
-            $procs += Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', 'while ($true) { $x = 1 }') -WindowStyle Hidden -PassThru
+            $procs += Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $loadEncoded) -WindowStyle Hidden -PassThru
         }
         for ($t = $seconds; $t -gt 0; $t -= 5) {
             Write-Host ('  {0,3} s left - listen for the fan...' -f $t) -ForegroundColor DarkYellow
@@ -662,8 +777,8 @@ $Steps.Add(@{ Name = 'Fan and cooling test'; Body = {
     }
 
     $answer = ''
-    while ($answer -notmatch '^[YyNnUu]$') {
-        $answer = Read-Host '  Did the fan get louder and blow warm air out of the vent? Y = yes, N = no, U = not sure'
+    while ($answer -notmatch '^[YyNnUuSs]$') {
+        $answer = Read-Host '  Did the fan get louder and blow warm air out of the vent? Y = yes, N = no, U = not sure, S = this laptop has no fan'
     }
     $tempText = ''
     if ($before.Count -gt 0 -and $during.Count -gt 0) {
@@ -672,6 +787,7 @@ $Steps.Add(@{ Name = 'Fan and cooling test'; Body = {
     switch -Regex ($answer) {
         '^[Yy]$' { Add-Result 'Fan under load' 'PASS' ('Fan spun up under 90 s of full load (tester confirmed).' + $tempText) }
         '^[Nn]$' { Add-Result 'Fan under load' 'FAIL' ('Fan did not respond to full load (tester observation).' + $tempText) 'Do not accept this laptop: the cooling fan is not working.' }
+        '^[Ss]$' { Add-Result 'Fan under load' 'INFO' ('Tester says this laptop is fanless.' + $tempText) 'Fanless laptops slow down instead of spinning a fan when hot. Check the model really is fanless in its specs.' }
         default  { Add-Result 'Fan under load' 'WARN' ('Tester was not sure the fan spun up.' + $tempText) 'Repeat somewhere quieter, or install HWiNFO and check the fan speed (RPM) rises under load.' }
     }
 }})
@@ -719,8 +835,9 @@ $Steps.Add(@{ Name = 'Storage health and file system'; Body = {
     if ($vol -and $vol.Size) {
         $freePct = [math]::Round(100.0 * $vol.FreeSpace / $vol.Size, 0)
         $detail = '{0} free of {1} ({2}%)' -f (Format-Bytes $vol.FreeSpace), (Format-Bytes $vol.Size), $freePct
-        if ($freePct -lt 15) { Add-Result 'Free space on C:' 'WARN' $detail 'Under 15% free slows Windows and blocks updates.' }
-        else { Add-Result 'Free space on C:' 'PASS' $detail }
+        $freeLabel = 'Free space on ' + $env:SystemDrive
+        if ($freePct -lt 15) { Add-Result $freeLabel 'WARN' $detail 'Under 15% free slows Windows and blocks updates.' }
+        else { Add-Result $freeLabel 'PASS' $detail }
     }
 
     if ($Quick) { Add-Result 'File system (chkdsk)' 'SKIP' 'Skipped in quick mode.' 'Covered by the full run.'; return }
@@ -741,7 +858,7 @@ $Steps.Add(@{ Name = 'Devices and drivers'; Body = {
             $n = $_.Name; if (-not $n) { $n = $_.DeviceID }
             '{0} (code {1})' -f $n, $_.ConfigManagerErrorCode
         }
-        Add-Result 'Device Manager problems' 'WARN' ($list -join "`n") 'Code 28 = missing driver: install drivers with Lenovo Vantage / System Update. Other codes after updating drivers can mean faulty hardware.'
+        Add-Result 'Device Manager problems' 'WARN' ($list -join "`n") ('Code 28 = missing driver: install drivers with {0}. Other codes that remain after updating drivers can mean faulty hardware.' -f $script:VI.Tools)
     } else {
         Add-Result 'Device Manager problems' 'PASS' 'Every device has a working driver.'
     }
@@ -764,7 +881,7 @@ $Steps.Add(@{ Name = 'Devices and drivers'; Body = {
         }
         $ok = @($devs | Where-Object { $_.Status -eq 'OK' })
         if ($ok.Count -gt 0) {
-            Add-Result $c.Label 'PASS' ((($ok | Select-Object -ExpandProperty FriendlyName -Unique) | Select-Object -First 6) -join ', ') 'Detected by Windows. Still test it by hand (Phase 3 of the plan).'
+            Add-Result $c.Label 'PASS' ((($ok | Select-Object -ExpandProperty FriendlyName -Unique) | Select-Object -First 6) -join ', ') 'Detected by Windows. Still test that it actually works (see the README: What it cannot test).'
         } elseif ($devs.Count -gt 0) {
             Add-Result $c.Label 'WARN' ('Found but not working: ' + (($devs | ForEach-Object { $_.FriendlyName + ' (' + $_.Status + ')' }) -join ', ')) 'Update drivers; if it stays broken, the part may be faulty.'
         } elseif ($c.Label -eq 'Fingerprint reader') {
@@ -792,7 +909,7 @@ $Steps.Add(@{ Name = 'Crash and hardware-error history'; Body = {
     $oldest = $null
     try { $oldest = (Get-WinEvent -LogName System -MaxEvents 1 -Oldest -ErrorAction Stop).TimeCreated } catch { }
     if ($oldest -and $oldest -gt $since) { $since = $oldest }
-    Add-Result 'Log window' 'INFO' ('Event logs checked from {0} to now.' -f $since.ToString('yyyy-MM-dd')) 'A recent reset empties the logs; re-run this script after a week of use (Phase 5).'
+    Add-Result 'Log window' 'INFO' ('Event logs checked from {0} to now.' -f $since.ToString('yyyy-MM-dd')) 'A recent reset empties the logs; re-run this script after a week of normal use.'
 
     $whea = Get-EventsSafe @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since }
     $wheaFatal = @($whea | Where-Object { $_.Level -le 2 })
@@ -847,7 +964,7 @@ $Steps.Add(@{ Name = 'Crash and hardware-error history'; Body = {
 }})
 
 # 10 -----------------------------------------------------------------------
-$Steps.Add(@{ Name = 'Windows Update and Lenovo tools'; Body = {
+$Steps.Add(@{ Name = 'Windows Update and manufacturer tools'; Body = {
     if ($Quick) { Add-Result 'Missing updates' 'SKIP' 'Skipped in quick mode.' 'Covered by the full run.' } else { try {
         Write-Host '  Asking Windows Update for missing updates (can take several minutes)...' -ForegroundColor DarkGray
         $session  = New-Object -ComObject Microsoft.Update.Session
@@ -879,12 +996,17 @@ $Steps.Add(@{ Name = 'Windows Update and Lenovo tools'; Body = {
                  'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') | Where-Object { Test-Path $_ }
     if (@($pending).Count -gt 0) { Add-Result 'Restart pending' 'INFO' 'Windows is waiting for a restart to finish updates.' }
 
-    $vantage = @()
-    try { $vantage = @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object { $_.Name -match 'LenovoCompanion|LenovoSettingsforEnterprise|LenovoVantage' } | ForEach-Object { $_.Name }) } catch { }
-    $lenovoApps = @(Get-InstalledPrograms | Where-Object { $_.DisplayName -match 'Lenovo (System Update|Vantage|Commercial Vantage)' } | ForEach-Object { $_.DisplayName })
-    $all = @($vantage + $lenovoApps | Select-Object -Unique)
-    if ($all.Count -gt 0) { Add-Result 'Lenovo update tools' 'PASS' ($all -join ', ') 'Use it to install Lenovo driver, firmware and BIOS updates.' }
-    else { Add-Result 'Lenovo update tools' 'INFO' 'Lenovo Vantage / System Update not installed.' 'Install Lenovo Vantage from the Microsoft Store (ThinkPads: Commercial Vantage or System Update) to get BIOS and driver updates.' }
+    $pattern = $script:VI.ToolPattern
+    if (-not $pattern) {
+        Add-Result 'Manufacturer update tool' 'INFO' ('Get drivers and firmware updates from: ' + $script:VI.Tools)
+    } else {
+        $storeApps = @()
+        try { $storeApps = @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object { $_.Name -match $pattern } | ForEach-Object { $_.Name }) } catch { }
+        $desktopApps = @(Get-InstalledPrograms | Where-Object { $_.DisplayName -match $pattern } | ForEach-Object { $_.DisplayName })
+        $all = @($storeApps + $desktopApps | Select-Object -Unique)
+        if ($all.Count -gt 0) { Add-Result 'Manufacturer update tool' 'PASS' ($all -join ', ') 'Use it to install the maker''s driver, firmware and BIOS updates.' }
+        else { Add-Result 'Manufacturer update tool' 'INFO' 'Not installed.' ('Install ' + $script:VI.Tools + ' to get BIOS, firmware and driver updates that Windows Update may not offer.') }
+    }
 }})
 
 # 11 -----------------------------------------------------------------------
@@ -899,7 +1021,7 @@ $Steps.Add(@{ Name = 'Network'; Body = {
         if ($line -match '^\s*(SSID|Radio type|Band|Channel|Receive rate \(Mbps\)|Signal)\s*:\s*(.+?)\s*$') { $fields[$Matches[1]] = $Matches[2] }
     }
     if ($fields.Count -gt 0) {
-        Add-Result 'Wi-Fi connection' 'INFO' (($fields.Keys | ForEach-Object { '{0}: {1}' -f $_, $fields[$_] }) -join '  |  ') 'Signal should be high near the router; test again two rooms away (Phase 3).'
+        Add-Result 'Wi-Fi connection' 'INFO' (($fields.Keys | ForEach-Object { '{0}: {1}' -f $_, $fields[$_] }) -join '  |  ') 'Signal should be high near the router; test again two rooms away.'
     }
 
     if ($SkipNetworkTest) { Add-Result 'Internet test' 'SKIP' 'Skipped by option.'; return }
@@ -1129,7 +1251,7 @@ if ($script:Artifacts.Count -gt 0) {
     [void]$sb.AppendLine('</table>')
 }
 
-[void]$sb.AppendLine('<h2>Not covered by this script</h2><p class="note"><b>Cold-start test:</b> shut down fully, wait 5 minutes, power on, and watch for "Fan error" or any other message before Windows loads. Repeat 3 times. This script cannot see that screen.<br><br>These also need a person or a reboot: screen (dead pixels, hinge flicker), keyboard and touchpad, speakers, microphone and webcam image, every port, Bluetooth pairing, the CPU/GPU stress test with temperatures, MemTest86, the battery rundown, and checking the BIOS screens by eye. Follow Phases 0-3 of the testing plan for those.</p>')
+[void]$sb.AppendLine('<h2>Not covered by this script</h2><p class="note"><b>Cold-start test:</b> shut down fully, wait 5 minutes, power on, and watch for "Fan error" or any other message before Windows loads. Repeat 3 times. This script cannot see that screen.<br><br>These also need a person or a reboot: screen (dead pixels, hinge flicker), keyboard and touchpad, speakers, microphone and webcam image, every port, Bluetooth pairing, the CPU/GPU stress test with temperatures, MemTest86, the battery rundown, and checking the BIOS screens by eye. The README section &quot;What it cannot test&quot; lists free tools for each.</p>')
 [void]$sb.AppendLine('</body></html>')
 
 $reportFile = Join-Path $script:OutDir 'report.html'

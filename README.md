@@ -5,7 +5,7 @@
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-A one-click health and software check for **used Windows laptops**, with extra checks for Lenovo ThinkPads. Double-click it, walk away, and read the HTML report when it finishes.
+A one-click health and software check for **used Windows laptops of any brand**, with extra firmware checks for Lenovo, Dell and HP. Double-click it, walk away, and read the HTML report when it finishes.
 
 It is built for the moment you buy second-hand. It catches the problems that are expensive to find out about later:
 
@@ -83,8 +83,9 @@ The report opens in the browser when it is done. It is saved to a folder on the 
 ### Option A: download the ZIP (easiest)
 
 1. Click **Code > Download ZIP**.
-2. **Extract** the ZIP. Running the `.bat` from inside the ZIP will not work; the launcher tells you if you try.
-3. Optional: copy the extracted folder to a USB flash drive, so you can run it on a laptop at the shop without internet.
+2. Recommended: right-click the ZIP > **Properties**, tick **Unblock** at the bottom, click **OK**. This stops Windows treating every file inside as "downloaded from the internet", which avoids most SmartScreen and Smart App Control prompts.
+3. **Extract** the ZIP. Running the `.bat` from inside the ZIP will not work; the launcher tells you if you try.
+4. Optional: copy the extracted folder to a USB flash drive, so you can run it on a laptop at the shop without internet.
 
 ### Option B: clone with Git
 
@@ -112,7 +113,7 @@ The script asks for administrator rights by itself if you start it without them.
 | --- | --- |
 | "Windows protected your PC" (SmartScreen) | Click **More info > Run anyway**. This appears for any script downloaded from the internet. |
 | User Account Control: "Do you want to allow this app to make changes?" | Click **Yes**. The checks need administrator rights to read battery, drive and security data. |
-| Fan test question (quick mode only) | Hold your hand at the air vent during the 90-second test, then answer **Y**, **N** or **U** (not sure). |
+| Fan test question (quick mode only) | Hold your hand at the air vent during the 90-second test, then answer **Y** (yes), **N** (no), **U** (not sure) or **S** (this laptop has no fan). |
 
 ---
 
@@ -193,7 +194,7 @@ Keep the folder with your receipt. If you need to complain to the seller, it rec
 | Area | Checks |
 | --- | --- |
 | **System inventory** | Manufacturer, model and machine type; serial in firmware vs Windows; BIOS version; CPU; each RAM module; drives; graphics; Windows edition and build |
-| **Ownership and locks** | Azure AD / domain / enterprise join, work or school accounts, MDM enrolment records, Windows Autopilot profile, Absolute (Computrace) agent in Windows, ThinkPad BIOS passwords and Absolute BIOS setting (via Lenovo WMI), enabled local accounts, administrators, leftover user profiles |
+| **Ownership and locks** | Azure AD / domain / enterprise join, work or school accounts, MDM enrolment records, Windows Autopilot profile, Absolute (Computrace) agent in Windows, BIOS passwords and the Absolute BIOS setting (Lenovo, Dell and HP business models, read from the maker's firmware WMI), enabled local accounts, administrators, leftover user profiles |
 | **Licence** | Activation status and channel (flags KMS volume activation, common with crack tools), factory key embedded in firmware (shown masked), Windows 10 end-of-support warning |
 | **Security** | Defender status and definition age, other antivirus, firewall, Secure Boot, TPM, BitLocker / device encryption, UAC, Remote Desktop, remote-access and remote-management tools (AnyDesk, TeamViewer, RustDesk, VNC, ScreenConnect, RMM agents and more), web proxy, hosts file, startup programs, non-Microsoft scheduled tasks |
 | **Battery** | Health % (full charge vs design capacity), cycle count, charge status, Windows battery report |
@@ -201,12 +202,23 @@ Keep the folder with your receipt. If you need to complain to the seller, it rec
 | **Storage** | Drive health, SSD wear %, power-on hours, temperature, uncorrected read/write errors, SMART failure prediction, free space, `chkdsk /scan` |
 | **Devices** | Device Manager errors, disabled devices, webcam, Wi-Fi, Bluetooth, audio and fingerprint reader present and working, full driver list, idle thermal zones |
 | **Stability** (last 60 days) | WHEA hardware errors, blue screens and crash dumps, unexpected shutdowns, storage errors in the event log, app crashes, Windows reliability index |
-| **Updates** | Missing Windows and driver updates, last update installed, pending restart, Lenovo Vantage / System Update present |
+| **Updates** | Missing Windows and driver updates, last update installed, pending restart, the maker's update tool present (Lenovo Vantage, Dell Command Update / SupportAssist, HP Support Assistant, MyASUS, Acer Care Center, MSI Center) |
 | **Network** | Connected adapters, Wi-Fi signal and link rate, internet access, download speed |
 | **System files** | `DISM /ScanHealth`, `sfc /verifyonly` |
 | **Malware** | Updates Defender definitions, then a full (or quick) scan; earlier detections in Defender history |
 
-Lenovo-specific BIOS checks work on ThinkPad, ThinkBook and other commercial models. IdeaPad, Yoga and Legion models do not expose them to Windows; the report says so and tells you how to check by hand. Every other check works on any Windows laptop.
+### Brand support
+
+Every check works on any Windows 10 or 11 laptop. Some extras depend on the brand:
+
+| Brand | BIOS password and Absolute checks | Advice in the report |
+| --- | --- | --- |
+| Lenovo ThinkPad / ThinkBook | Yes | Lenovo support site, BIOS key, Lenovo Vantage |
+| Dell business models (Latitude, Precision, many Vostro) | Yes | Dell support site, F2, Dell Command Update |
+| HP business models (EliteBook, ProBook, ZBook) | Yes | HP support site, Esc/F10, HP Support Assistant |
+| Lenovo IdeaPad / Yoga / Legion, consumer Dell and HP, ASUS, Acer, MSI, Microsoft Surface, others | Not exposed to Windows: the report tells you which key opens the BIOS so you can check by hand | Brand's support site, BIOS key and update tool where known |
+
+On a desktop PC the battery check is skipped instead of failing.
 
 ---
 
@@ -278,6 +290,9 @@ The code is a single readable PowerShell file. Read it before you run it.
 | Battery shows FAIL "No battery detected" | The battery is disconnected, dead, or missing. On a desktop this is expected. |
 | BIOS passwords show SKIP | Normal on IdeaPad, Yoga and Legion. Check by opening the BIOS (F2 or Fn+F2). |
 | No fan speed in HWiNFO | Expected on ThinkPads with recent HWiNFO. Use temperature and airflow instead. |
+| "This app can't run on your PC" / PowerShell won't open at all | The laptop is in **Windows S mode**, which only allows Store apps. Switching out is free (Settings > System > Activation > Switch out of S mode) but one-way. |
+| Smart App Control blocked the file | Unblock the ZIP before extracting (see [Setup](#option-a-download-the-zip-easiest)), or run the `.ps1` from PowerShell. |
+| "Saving the report to C:\LaptopHealthCheck-Reports instead" | Controlled folder access (ransomware protection) blocked the Desktop. The report is in that folder instead. |
 | Defender scan shows SKIP | Another antivirus is installed and Defender is passive. Scan with that antivirus instead. |
 
 ---
